@@ -1,0 +1,280 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import { GAMES, gameNames } from "@/lib/games";
+import { operator, rp } from "@/lib/format";
+import { saveOrder } from "@/lib/store";
+import type { OrderLine } from "@/lib/store";
+import { TAB_EVENT } from "./TabLink";
+
+type TabKey = "pulsa" | "data" | "pln" | "game" | "ewallet" | "tagihan";
+
+const TABS: { key: TabKey; label: string }[] = [
+  { key: "pulsa", label: "Pulsa" },
+  { key: "data", label: "Data" },
+  { key: "pln", label: "PLN" },
+  { key: "game", label: "Game" },
+  { key: "ewallet", label: "E‑Wallet" },
+  { key: "tagihan", label: "Tagihan" },
+];
+
+type Product = { l: string; ph: string; n: [string, number][] };
+
+const P: Record<TabKey, Product> = {
+  pulsa: {
+    l: "Nomor HP",
+    ph: "08xx xxxx xxxx",
+    n: [
+      ["5rb", 6500],
+      ["10rb", 11000],
+      ["20rb", 20800],
+      ["25rb", 25800],
+      ["50rb", 50300],
+      ["100rb", 99500],
+    ],
+  },
+  data: {
+    l: "Nomor HP",
+    ph: "08xx xxxx xxxx",
+    n: [
+      ["2GB", 12000],
+      ["5GB", 25000],
+      ["10GB", 45000],
+      ["15GB", 60000],
+      ["25GB", 85000],
+      ["50GB", 130000],
+    ],
+  },
+  pln: {
+    l: "Nomor meter / ID pelanggan",
+    ph: "Contoh: 5123 4567 8901",
+    n: [
+      ["20rb", 20800],
+      ["50rb", 50300],
+      ["100rb", 100300],
+      ["200rb", 200300],
+      ["500rb", 500300],
+      ["1jt", 1000300],
+    ],
+  },
+  ewallet: {
+    l: "Nomor e-wallet",
+    ph: "08xx xxxx xxxx",
+    n: [
+      ["10rb", 11000],
+      ["25rb", 26000],
+      ["50rb", 51000],
+      ["100rb", 101000],
+      ["200rb", 201000],
+      ["500rb", 501000],
+    ],
+  },
+  game: { l: "User ID", ph: "Masukkan User ID", n: [] },
+  tagihan: {
+    l: "ID pelanggan",
+    ph: "BPJS / PDAM / internet",
+    n: [
+      ["BPJS", 2500],
+      ["PDAM", 2500],
+      ["TV & Internet", 2500],
+      ["Multifinance", 3500],
+    ],
+  },
+};
+
+const SERVICE_NAME: Record<TabKey, string> = {
+  pulsa: "Pulsa",
+  data: "Paket Data",
+  pln: "Token PLN",
+  game: "",
+  ewallet: "E-Wallet",
+  tagihan: "Tagihan",
+};
+
+const SERVICE_SLUG: Record<TabKey, string> = {
+  pulsa: "pulsa",
+  data: "paket-data",
+  pln: "pln",
+  game: "top-up-game",
+  ewallet: "e-wallet",
+  tagihan: "pdam",
+};
+
+const digits = (v: string) => v.replace(/\D/g, "");
+
+export function BuyWidget() {
+  const router = useRouter();
+
+  const [tab, setTab] = useState<TabKey>("pulsa");
+  const [game, setGame] = useState(gameNames[0]);
+  const [sel, setSel] = useState<number | null>(null);
+  const [num, setNum] = useState("");
+  const [zone, setZone] = useState("");
+
+  useEffect(() => {
+    const fromUrl = new URLSearchParams(window.location.search).get("tab");
+    if (fromUrl && fromUrl in P) setTab(fromUrl as TabKey);
+
+    const onTab = (e: Event) => {
+      const next = (e as CustomEvent<string>).detail;
+      if (next && next in P) setTab(next as TabKey);
+    };
+    window.addEventListener(TAB_EVENT, onTab);
+    return () => window.removeEventListener(TAB_EVENT, onTab);
+  }, []);
+
+  useEffect(() => {
+    setSel(null);
+  }, [tab, game]);
+
+  const products: [string, number][] = tab === "game" ? GAMES[game].chips.map(([a, , p]) => [a, p]) : P[tab].n;
+
+  const op = tab === "pulsa" || tab === "data" || tab === "ewallet" ? operator(num) : "";
+  const selected = sel !== null ? products[sel] : null;
+  const price = selected ? selected[1] : 0;
+  const zoneVisible = tab === "game" && GAMES[game].zone;
+  const canPay = price > 0 && digits(num).length >= (tab === "game" ? 5 : 8);
+
+  const selectTab = useCallback((key: TabKey) => {
+    setTab(key);
+    window.history.replaceState(null, "", `/?tab=${key}`);
+  }, []);
+  const handlePay = () => {
+    if (!canPay || !selected) return;
+    const service = tab === "game" ? game : SERVICE_NAME[tab];
+    const lines: OrderLine[] = [
+      ["Layanan", service],
+      [P[tab].l, num + (op ? ` · ${op}` : "")],
+      ["Produk", selected[0]],
+    ];
+    if (zoneVisible && zone) lines.push(["Zone ID", zone]);
+
+    saveOrder({
+      ok: true,
+      slug: SERVICE_SLUG[tab],
+      service,
+      product: selected[0],
+      price,
+      admin: 0,
+      lines,
+      type: tab === "game" ? "game" : "prepaid",
+    });
+    router.push("/checkout/");
+  };
+
+  return (
+    <div className="card p-5 md:p-7">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h2 className="text-xl md:text-2xl font-extrabold">Mulai transaksi</h2>
+          <p className="text-sm text-[#6B6A80] mt-1">Pilih produk dan isi data tujuan.</p>
+        </div>
+        <span className="shrink-0 inline-flex items-center gap-1.5 rounded-full bg-[#F0F9E8] text-[#3F6212] px-3 py-1.5 text-[11px] font-bold">
+          <span className="w-1.5 h-1.5 rounded-full bg-[#65A30D]" />
+          Online 24/7
+        </span>
+      </div>
+
+      <div className="mt-5 flex gap-2 overflow-x-auto pb-1 -mx-1 px-1 [scrollbar-width:none]">
+        {TABS.map((t) => (
+          <button
+            key={t.key}
+            type="button"
+            aria-pressed={tab === t.key}
+            onClick={() => selectTab(t.key)}
+            className={`chip shrink-0 border border-[#E6E4F0] px-4 py-2 rounded-full text-sm font-semibold transition ${
+              tab === t.key ? "on" : "bg-white hover:border-[#CFC7FF]"
+            }`}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "game" && (
+        <div className="mt-5">
+          <div className="text-sm font-semibold">Pilih game</div>
+          <div className="mt-2 grid grid-cols-2 sm:grid-cols-4 gap-2">
+            {gameNames.map((name) => (
+              <button
+                key={name}
+                type="button"
+                aria-pressed={name === game}
+                onClick={() => setGame(name)}
+                className={`opt p-3 text-sm font-bold ${name === game ? "on" : ""}`}
+              >
+                <div className="disp leading-tight">{name}</div>
+                <div className="text-[11px] font-medium text-[#6B6A80] mt-1">
+                  Mulai {rp(GAMES[name].chips[0][2])}
+                </div>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <label className="block mt-5 text-sm font-semibold" htmlFor="buy-num">
+        {P[tab].l}
+      </label>
+      <div className="mt-2 relative">
+        <input
+          id="buy-num"
+          value={num}
+          onChange={(e) => setNum(e.target.value)}
+          inputMode="numeric"
+          placeholder={P[tab].ph}
+          className="inp text-lg"
+        />
+        <span
+          className={`absolute right-3 top-1/2 -translate-y-1/2 text-xs font-bold bg-[#EDE9FF] text-[#5B3DF5] px-2.5 py-1 rounded-full ${
+            op ? "" : "hidden"
+          }`}
+        >
+          {op}
+        </span>
+      </div>
+
+      <input
+        value={zone}
+        onChange={(e) => setZone(e.target.value)}
+        placeholder="Zone ID"
+        aria-label="Zone ID"
+        className={`${zoneVisible ? "" : "hidden"} inp mt-3`}
+      />
+
+      <div className="mt-5 text-sm font-semibold">Pilih nominal</div>
+      <div className="mt-2 grid grid-cols-2 sm:grid-cols-3 gap-2.5">
+        {products.map(([label, value], i) => (
+          <button
+            key={label}
+            type="button"
+            aria-pressed={sel === i}
+            onClick={() => setSel(i)}
+            className={`opt ${sel === i ? "on" : ""}`}
+          >
+            <div className="disp text-lg font-bold">{label}</div>
+            <div className="text-xs text-[#6B6A80] mt-1">
+              {tab === "tagihan" ? `admin ${rp(value)}` : rp(value)}
+            </div>
+          </button>
+        ))}
+      </div>
+
+      <div className="mt-5 flex items-center justify-between gap-3 bg-[#F6F5FB] rounded-[18px] p-3.5 pl-4">
+        <div>
+          <div className="text-[11px] text-[#6B6A80]">Total bayar</div>
+          <div className="disp text-xl md:text-2xl font-extrabold">{rp(price)}</div>
+        </div>
+        <button
+          type="button"
+          onClick={handlePay}
+          disabled={!canPay}
+          className="btn-accent shrink-0 px-5 md:px-6 py-3"
+        >
+          Bayar →
+        </button>
+      </div>
+    </div>
+  );
+}
