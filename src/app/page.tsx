@@ -5,6 +5,7 @@ import { Icon } from "@/components/Icons";
 import { BuyWidget } from "@/components/BuyWidget";
 import { CopyButton } from "@/components/CopyButton";
 import { services, serviceBySlug } from "@/lib/services";
+import { getStorefront } from "@/lib/catalog-hydrate";
 import type { Service } from "@/lib/services";
 
 const GROUPS: { title: string; style: React.CSSProperties; slugs: string[] }[] = [
@@ -62,7 +63,9 @@ function ServiceRow({ service }: { service: Service }) {
   );
 }
 
-export default function Home() {
+export default async function Home() {
+  const storefront = await getStorefront();
+
   return (
     <>
       <Header variant="home" />
@@ -109,7 +112,7 @@ export default function Home() {
             </div>
 
             <div id="beli" className="min-w-0 scroll-mt-24">
-              <BuyWidget />
+              <BuyWidget services={storefront.services} games={storefront.games} />
             </div>
           </div>
 

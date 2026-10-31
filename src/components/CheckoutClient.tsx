@@ -5,15 +5,17 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Icon } from "./Icons";
 import { hash, rp } from "@/lib/format";
-import { clearOrder, loadOrder, loadOrders, saveOrders } from "@/lib/store";
-import type { Order, SavedOrder } from "@/lib/store";
+import { loadOrder } from "@/lib/store";
+import type { Order } from "@/lib/store";
+import { checkVoucher, createOrder } from "@/lib/db/client";
+import { toPublicError } from "@/lib/db/errors";
 
 type Method = { id: string; n: string; d?: string; fee: number; pct?: number; g: string };
 
 const METHODS: { g: string; list: Omit<Method, "g">[] }[] = [
   {
     g: "QRIS",
-    list: [{ id: "qris", n: "QRIS", d: "Semua e-wallet & m-banking", fee: 0, pct: 0.007 }],
+    list: [{ id: "qris", n: "QRIS", d: "Semua e-wallet & m-banking", fee: 0 }],
   },
   {
     g: "Virtual Account",
@@ -53,12 +55,24 @@ const STEPS: [number, string][] = [
 const QRIS_IMAGE = "https://res.cloudinary.com/dqjh7utdb/image/upload/v1792161327/camhvfeu1lcm0ps8ieiz.jpg";
 const ADMIN_WHATSAPP = "https://wa.me/6285711172317";
 
-export function CheckoutClient() {
+export function CheckoutClient({
+  brandSlug,
+  qrisMethodId,
+  qrisImageUrl,
+}: {
+  brandSlug: string;
+  qrisMethodId: string | null;
+  qrisImageUrl: string | null;
+}) {
   const router = useRouter();
 
   const [order, setOrder] = useState<Order | null>(null);
   const [ready, setReady] = useState(false);
   const [inv, setInv] = useState("");
+  const [expiresAt, setExpiresAt] = useState(0);
+  const [orderTotal, setOrderTotal] = useState(0);
+  const [creating, setCreating] = useState(false);
+  const [payError, setPayError] = useState("");
   const [method, setMethod] = useState<Method | null>(null);
   const [disc, setDisc] = useState(0);
   const [step, setStep] = useState(1);
@@ -68,77 +82,40 @@ export function CheckoutClient() {
     text: "",
     tone: "none",
   });
-  const [left, setLeft] = useState(900);
+  const [left, setLeft] = useState(0);
   const [timedOut, setTimedOut] = useState(false);
   const [copied, setCopied] = useState(false);
 
-  const leftRef = useRef(900);
-
   useEffect(() => {
     setOrder(loadOrder());
-    setInv("PDX" + Date.now().toString().slice(-9));
     setReady(true);
   }, []);
 
   const fee = useMemo(() => {
     if (!order || !method) return 0;
-    return Math.round(method.fee + (method.pct ?? 0) * (order.price + order.admin));
+    return Math.round(method.fee);
   }, [order, method]);
 
   const total = order ? order.price + order.admin + fee - disc : 0;
+  const displayTotal = inv && orderTotal ? orderTotal : total;
 
-  const saveOrd = useCallback(
-    (status: "pending" | "processing" | "success", sn?: string, label?: string) => {
-      if (!order) return;
-      const all = loadOrders();
-      const i = all.findIndex((x) => x.inv === inv);
-      const prev = i >= 0 ? all[i] : undefined;
-      const record: SavedOrder = {
-        inv,
-        status,
-        service: order.service,
-        product: order.product,
-        lines: order.lines,
-        method: method?.n ?? "",
-        total: order.price + order.admin + fee - disc,
-        contact,
-        sn: sn || prev?.sn || "",
-        label: label || prev?.label || "",
-        created: prev?.created ?? Date.now(),
-        updated: Date.now(),
-      };
-      if (status !== "pending") record.paidAt = Date.now();
-      if (i >= 0) all[i] = record;
-      else all.unshift(record);
-      saveOrders(all);
-    },
-    [order, inv, method, fee, disc, contact],
-  );
-
-  // The original auto-selects QRIS and jumps straight to the payment step.
   useEffect(() => {
     if (!ready || !order) return;
     setMethod(ALL.find((m) => m.id === "qris") ?? null);
-    setStep(2);
+    setStep(1);
   }, [ready, order]);
 
   useEffect(() => {
-    if (step !== 2 || !order) return;
-    leftRef.current = 900;
-    setLeft(900);
-    setTimedOut(false);
-    saveOrd("pending");
-    const t = setInterval(() => {
-      leftRef.current -= 1;
-      setLeft(leftRef.current);
-      if (leftRef.current <= 0) {
-        clearInterval(t);
-        setTimedOut(true);
-      }
-    }, 1000);
-    return () => clearInterval(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [step, order]);
+    if (step !== 2 || !expiresAt) return;
+    const tick = () => {
+      const next = Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000));
+      setLeft(next);
+      if (next <= 0) setTimedOut(true);
+    };
+    tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => window.clearInterval(timer);
+  }, [step, expiresAt]);
 
   const summaryRows = useMemo(() => {
     if (!order) return [];
@@ -153,31 +130,81 @@ export function CheckoutClient() {
     return rows;
   }, [order, method, fee, disc]);
 
-  const applyPromo = () => {
+  const applyPromo = async () => {
     if (!order) return;
     const code = promo.trim().toUpperCase();
-    if (code === "PODERIX10") {
-      if (order.slug === "pln") {
-        const d = Math.min(10000, Math.round(order.price * 0.1));
-        setDisc(d);
-        setPromoMsg({ text: `Promo dipakai, hemat ${rp(d)}.`, tone: "ok" });
-      } else {
-        setDisc(0);
-        setPromoMsg({ text: "Kode ini khusus token PLN.", tone: "err" });
-      }
-    } else {
+    if (!code) {
       setDisc(0);
-      setPromoMsg({
-        text: code ? "Kode promo tidak ditemukan." : "Masukkan kode promo dulu.",
-        tone: "err",
+      setPromoMsg({ text: "Masukkan kode promo dulu.", tone: "err" });
+      return;
+    }
+    if (!order.dbServiceId) {
+      setDisc(0);
+      setPromoMsg({ text: "Pembayaran belum tersedia. Coba lagi sebentar.", tone: "err" });
+      return;
+    }
+
+    try {
+      const result = await checkVoucher({
+        brandSlug,
+        code,
+        serviceId: order.dbServiceId,
+        subtotal: order.price,
       });
+      if (!result.valid) {
+        setDisc(0);
+        setPromoMsg({ text: result.pesan || "Kode promo tidak valid.", tone: "err" });
+        return;
+      }
+      setDisc(result.potongan);
+      setPromoMsg({ text: `Promo dipakai, hemat ${rp(result.potongan)}.`, tone: "ok" });
+    } catch (promoFailure) {
+      setDisc(0);
+      setPromoMsg({ text: toPublicError(promoFailure).message, tone: "err" });
+    }
+  };
+
+  const createAndPay = async () => {
+    if (!order?.dbServiceId || !order.dbProductId || !order.target) {
+      setPayError("Data pesanan belum lengkap. Ulangi dari halaman layanan.");
+      return;
+    }
+    if (!qrisMethodId || !brandSlug) {
+      setPayError("Pembayaran belum tersedia. Coba lagi sebentar.");
+      return;
+    }
+
+    setPayError("");
+    setCreating(true);
+    try {
+      const created = await createOrder({
+        brandSlug,
+        serviceId: order.dbServiceId,
+        productId: order.dbProductId,
+        nomorTujuan: order.target,
+        input: {
+          ...(order.input ?? {}),
+          nomor_tujuan: order.target,
+          ...(contact.trim() ? { kontak: contact.trim() } : {}),
+        },
+        paymentMethodId: qrisMethodId,
+        voucherCode: disc > 0 ? promo.trim().toUpperCase() : null,
+      });
+      setInv(created.ref);
+      setOrderTotal(created.total);
+      setExpiresAt(new Date(created.expires_at).getTime());
+      setLeft(Math.max(1, Math.ceil((new Date(created.expires_at).getTime() - Date.now()) / 1000)));
+      setTimedOut(false);
+      setStep(2);
+    } catch (orderFailure) {
+      setPayError(toPublicError(orderFailure).message);
+    } finally {
+      setCreating(false);
     }
   };
 
   const markPaid = () => {
     if (!order) return;
-    saveOrd("processing");
-    clearOrder();
     setStep(3);
   };
 
@@ -202,12 +229,12 @@ export function CheckoutClient() {
       ["Waktu", new Date().toLocaleString("id-ID")],
       ...order.lines,
       ["Metode", method?.n ?? ""],
-      ["Total pembayaran", rp(total)],
+      ["Total pembayaran", rp(displayTotal)],
     ];
     if (contact.trim()) rows.push(["Bukti dikirim ke", contact.trim()]);
     return rows;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [order, inv, method, total, contact]);
+  }, [order, inv, method, displayTotal, contact]);
 
   if (!ready) {
     return <div className="h-40" />;
@@ -288,19 +315,18 @@ export function CheckoutClient() {
                         <button
                           key={m.id}
                           type="button"
+                          disabled={m.id !== "qris"}
                           onClick={() => setMethod({ ...m, g: group.g })}
                           className={`opt flex justify-between items-center gap-3 ${
                             method?.id === m.id ? "on" : ""
-                          }`}
+                          } ${m.id !== "qris" ? "cursor-not-allowed opacity-45" : ""}`}
                         >
                           <span>
                             <span className="font-semibold block">{m.n}</span>
                             {m.d && <span className="text-xs text-[#6B6A80]">{m.d}</span>}
                           </span>
                           <span className="text-xs font-semibold text-[#6B6A80] whitespace-nowrap">
-                            {m.pct
-                              ? `+${(m.pct * 100).toFixed(1).replace(".0", "")}%`
-                              : `+${rp(m.fee)}`}
+                            {m.id !== "qris" ? "Segera" : m.fee ? `+${rp(m.fee)}` : "Gratis"}
                           </span>
                         </button>
                       ))}
@@ -330,7 +356,7 @@ export function CheckoutClient() {
                 />
                 <button
                   type="button"
-                  onClick={applyPromo}
+                  onClick={() => void applyPromo()}
                   className="shrink-0 border border-[#E6E4F0] bg-white rounded-[14px] px-5 font-semibold hover:border-black"
                 >
                   Pakai
@@ -378,7 +404,7 @@ export function CheckoutClient() {
                     <br />
                     <div className="w-full max-w-[320px] mx-auto p-3 bg-white border border-[#E6E4F0] rounded-2xl">
                       <img
-                        src={QRIS_IMAGE}
+                        src={qrisImageUrl || QRIS_IMAGE}
                         alt="Kode QRIS Poderix Digital"
                         width={640}
                         height={640}
@@ -386,7 +412,7 @@ export function CheckoutClient() {
                         className="block w-full h-auto rounded-lg"
                       />
                     </div>
-                    <div className="disp text-2xl font-bold mt-4">{rp(total)}</div>
+                    <div className="disp text-2xl font-bold mt-4">{rp(displayTotal)}</div>
                     <div className="text-sm text-[#6B6A80]">a.n. Poderix Digital</div>
                   </div>
                 )}
@@ -407,14 +433,14 @@ export function CheckoutClient() {
                       </button>
                     </div>
                     <div className="mt-4 text-sm text-[#6B6A80]">Jumlah transfer</div>
-                    <div className="disp text-2xl font-bold">{rp(total)}</div>
+                    <div className="disp text-2xl font-bold">{rp(displayTotal)}</div>
                   </div>
                 )}
 
                 {method && method.g === "E-Wallet" && (
                   <div className="rounded-2xl border border-[#E6E4F0] p-5 text-center">
                     <div className="text-sm text-[#6B6A80]">Tagihan dikirim ke aplikasi {method.n}</div>
-                    <div className="disp text-2xl font-bold mt-2">{rp(total)}</div>
+                    <div className="disp text-2xl font-bold mt-2">{rp(displayTotal)}</div>
                     <a href="#" onClick={(e) => e.preventDefault()} className="btn inline-block mt-4">
                       Buka {method.n}
                     </a>
@@ -445,13 +471,7 @@ export function CheckoutClient() {
                   085711172317
                 </a>
               </p>
-              <button
-                type="button"
-                onClick={() => setStep(1)}
-                className="w-full mt-3 text-sm font-semibold text-[#6B6A80] hover:text-black"
-              >
-                Ganti metode pembayaran
-              </button>
+
             </section>
           )}
 
@@ -512,17 +532,22 @@ export function CheckoutClient() {
             </div>
             <div className="mt-5 pt-5 border-t border-dashed border-[#E6E4F0] flex justify-between items-baseline">
               <span className="text-[#6B6A80] text-sm">Total bayar</span>
-              <span className="disp text-2xl font-bold">{rp(total)}</span>
+              <span className="disp text-2xl font-bold">{rp(displayTotal)}</span>
             </div>
             {step === 1 && (
-              <button
-                type="button"
-                onClick={() => setStep(2)}
-                disabled={!method}
-                className="btn w-full mt-5"
-              >
-                Bayar sekarang →
-              </button>
+              <>
+                <button
+                  type="button"
+                  onClick={() => void createAndPay()}
+                  disabled={!method || creating}
+                  className="btn w-full mt-5 disabled:cursor-wait disabled:opacity-60"
+                >
+                  {creating ? "Memproses…" : "Bayar sekarang →"}
+                </button>
+                {payError ? (
+                  <p className="mt-2 text-sm font-semibold text-[#E11D48]">{payError}</p>
+                ) : null}
+              </>
             )}
             <p className="text-xs text-[#6B6A80] mt-3 text-center">
               Dana kembali otomatis kalau transaksi gagal.
